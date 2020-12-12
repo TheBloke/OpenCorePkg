@@ -18,6 +18,10 @@
 #include <Library/UefiBootServicesTableLib.h>
 #include <Protocol/PlatformDriverOverride.h>
 
+#include <Library/DevicePathLib.h>
+#include <Library/BaseLib.h>
+#include <IHandle.h>
+
 //
 // NULL-terminated list of driver handles that will be served by EFI_PLATFORM_DRIVER_OVERRIDE_PROTOCOL.
 //
@@ -210,6 +214,8 @@ OcConnectDrivers (
   EFI_OPEN_PROTOCOL_INFORMATION_ENTRY  *ProtocolInfos;
   UINTN                                ProtocolInfoCount;
   BOOLEAN                              Connect;
+  CHAR16                               *UnicodeDevicePath;
+  IHANDLE                              *TemporaryIHandle;
 
   //
   // We locate only handles with device paths as connecting other handles
@@ -227,7 +233,53 @@ OcConnectDrivers (
     return Status;
   }
 
+  //
+  // Veto handles based on device path
+  //
+  // This technically only invalidates the signature on the vetoed handles, which is the most performant and reliable method of vetoing them. If handles were being iterated via linked list references instead of via array index, the commented out RemoveEntryList call would be necessary as well.
+  // Background: The Gigabyte X299X Designare 10G motherboard has a nasty firmware bug that hard-resets the motherboard and triggers a boot failure (resetting various settings) when driver connection to a specific child handle is attempted. To avoid this issue, we compute the unicode device paths for all handles returned by the previous query and compare them to a list of vetoed device paths which must be removed, as recursive ConnectController calls reaching/impacting any of these device paths would trigger the bug.
+  // Note that the PNP0F03 & PNP0C08 device paths may not trigger the bug reliably (or possibly at all). However, it's safer to just veto these ones as well.
+  //
   for (DeviceIndex = 0; DeviceIndex < HandleCount; ++DeviceIndex) {
+    //DEBUG ((DEBUG_INFO, "OCDC: Getting DP [i=%d/%d]\n", DeviceIndex, HandleCount));
+
+    // Get device path for this handle and convert it to text
+    UnicodeDevicePath = ConvertDevicePathToText (DevicePathFromHandle (HandleBuffer[DeviceIndex]), FALSE, FALSE);
+    
+    if (UnicodeDevicePath != NULL) {
+      //DEBUG ((DEBUG_INFO, "OCDC: DP [i=%d/%d] is %s\n", DeviceIndex, HandleCount, UnicodeDevicePath));
+
+      // Check if this device path matches a vetoed device path
+      if ( (StrCmp(UnicodeDevicePath, L"PciRoot(0x0)") == 0)
+        || (StrCmp(UnicodeDevicePath, L"PciRoot(0x0)/Pci(0x1F,0x0)") == 0)
+        || (StrCmp(UnicodeDevicePath, L"PciRoot(0x0)/Pci(0x1F,0x0)/Acpi(PNP0303,0x0)") == 0)
+        || (StrCmp(UnicodeDevicePath, L"PciRoot(0x0)/Pci(0x1F,0x0)/Acpi(PNP0F03,0x0)") == 0)
+        || (StrCmp(UnicodeDevicePath, L"PciRoot(0x0)/Pci(0x1F,0x0)/Acpi(PNP0C08,0x0)") == 0)
+        || (StrCmp(UnicodeDevicePath, L"PciRoot(0x0)/Pci(0x1F,0x0)/Acpi(PNP0C08,0x1)") == 0)
+        ) {
+        // Device path matches a vetoed device path!
+        DEBUG ((DEBUG_INFO, "OCDC: DP [i=%d/%d] %s matches a vetoed device path - vetoing handle\n", DeviceIndex, HandleCount, UnicodeDevicePath));
+        
+        // Loosely based on UDK/MdeModulePkg/Universal/HiiDatabaseDxe/Database.c:3682
+        TemporaryIHandle = (IHANDLE *)HandleBuffer[DeviceIndex];
+        
+        // Invalidate signature
+        TemporaryIHandle->Signature = 0;
+
+        // Only necessary if iterating via linked list, otherwise you can do without this
+        // RemoveEntryList(&TemporaryIHandle->AllHandles);
+        
+        // Not sure if/where this is appropriate, technically you could free the memory this way, but with the pointers intact, it should get freed when HandleBuffer is freed...
+        // FreePool (TemporaryIHandle);
+      }
+
+      FreePool (UnicodeDevicePath);
+    }
+  }
+
+  for (DeviceIndex = 0; DeviceIndex < HandleCount; ++DeviceIndex) {
+    //DEBUG ((DEBUG_INFO, "OCDC: Getting DP [i=%d/%d] 0x%016x\n", DeviceIndex, HandleCount, HandleBuffer[DeviceIndex]));
+
     //
     // Only connect parent handles as we connect recursively.
     // This improves the performance by more than 30 seconds
